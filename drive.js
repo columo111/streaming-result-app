@@ -1,6 +1,6 @@
 // Googleドライブへの保存(Google Identity Services のトークン方式 + Drive REST API)
 // スコープは drive.file: このアプリが作成したファイル/フォルダにしかアクセスできない。
-const DRIVE_CLIENT_ID = '';   // Google Cloud で作成した OAuth クライアントID(秘密ではない)
+const DRIVE_CLIENT_ID = '1057365388753-1f2rf7eat83s5b1c6l73hpup5qemt73g.apps.googleusercontent.com';   // Google Cloud で作成した OAuth クライアントID(秘密ではない)
 const DRIVE_ROOT_FOLDER = 'StreamResults';
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 
