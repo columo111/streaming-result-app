@@ -109,23 +109,39 @@ function inspect(buf) {
   return info;
 }
 
+// 元画像は解析・切り出しのときだけ読み込んで手放す(78枚でもiPadのメモリに収まるように)。
+// 画面に持つのは縮小画像だけで、最終出力は生成時に元ファイルから1枚ずつ切り出す。
+const PREVIEW_W = 320;
+let jobs = Promise.resolve();   // 画像の読み込みを1枚ずつ直列に行う
+const enqueue = fn => (jobs = jobs.then(fn, fn));
+async function withImage(file, fn) {
+  const url = URL.createObjectURL(file), img = new Image();
+  try {
+    await new Promise((ok, ng) => { img.onload = ok; img.onerror = () => ng(new Error('画像を読み込めません: ' + file.name)); img.src = url; });
+    return await fn(img);
+  } finally { img.src = ''; URL.revokeObjectURL(url); }
+}
+
 async function handle(file) {
-  const buf = await file.arrayBuffer();
-  const info = inspect(buf);
-  const url = URL.createObjectURL(new Blob([buf], { type: file.type }));
-  const img = new Image(); await new Promise((ok, ng) => { img.onload = ok; img.onerror = ng; img.src = url; });
-  const w = img.naturalWidth, h = img.naturalHeight;
-  const ratio = columnBrightRatio(img, +$('#thr').value);
-  const b = { w, h };
-  const bands = detectBands(ratio, +$('#ratio').value / 100, true);
-  const score = matchScore(featureOf(img, bands.left, bands.right), RESULT_TEMPLATE);
+  const info = inspect(await file.arrayBuffer());
+  const first = await withImage(file, img => {
+    const w = img.naturalWidth, h = img.naturalHeight;
+    const bands = detectBands(columnBrightRatio(img, +$('#thr').value), +$('#ratio').value / 100, true);
+    const score = matchScore(featureOf(img, bands.left, bands.right), RESULT_TEMPLATE);
+    const small = document.createElement('canvas');   // 画面表示用の縮小画像
+    small.width = PREVIEW_W; small.height = Math.round(h * PREVIEW_W / w);
+    small.getContext('2d').drawImage(img, 0, 0, small.width, small.height);
+    return { w, h, score, small };
+  });
+  const { w, h, score, small } = first;
+  const sc = small.width / w;
 
   const exifDate = info.exif && (info.exif.DateTimeOriginal || info.exif.DateTimeDigitized || info.exif.DateTime);
   const tEXt = Object.entries(info.text).map(([k, v]) => `${k}=${v}`).join(' / ');
   const rows = [
     ['ファイル名', file.name],
     ['形式', `${file.type || '(type無し)'} / 実体: ${info.container}`],
-    ['サイズ', `${b.w}×${b.h}px / ${(file.size/1024).toFixed(0)}KB`],
+    ['サイズ', `${w}×${h}px / ${(file.size/1024).toFixed(0)}KB`],
     ['lastModified', `<span class="${file.lastModified ? 'ok' : 'ng'}">${fmt(new Date(file.lastModified))}</span>`],
     ['Exif日時', exifDate ? `<span class="ok">${exifDate}</span>` : '<span class="ng">なし</span>'],
     ['種別判定', null],
@@ -133,7 +149,7 @@ async function handle(file) {
     ['PNGテキスト', tEXt || '-'],
   ];
 
-  const crop = document.createElement('canvas');
+  const crop = document.createElement('canvas');   // 切り取り結果の縮小プレビュー
   const info2 = document.createElement('div');
   const sl = document.createElement('input'); sl.type = 'range'; sl.min = 0; sl.max = Math.floor(w / 2); sl.style.width = '100%';
   const sr = document.createElement('input'); sr.type = 'range'; sr.min = 0; sr.max = Math.floor(w / 2); sr.style.width = '100%';
@@ -142,49 +158,58 @@ async function handle(file) {
   const redraw = () => {
     const L = +sl.value, R = +sr.value, T = +st.value, B = +sb.value;
     const cw = w - L - R, ch = h - T - B;
-    crop.width = cw; crop.height = ch;
-    crop.getContext('2d').drawImage(img, L, T, cw, ch, 0, 0, cw, ch);
+    crop.width = Math.max(1, Math.round(cw * sc)); crop.height = Math.max(1, Math.round(ch * sc));
+    crop.getContext('2d').drawImage(small, L * sc, T * sc, cw * sc, ch * sc, 0, 0, crop.width, crop.height);
     info2.textContent = `左 ${L} / 右 ${R} / 上 ${T} / 下 ${B}px → ${cw}×${ch}px`;
   };
-  const auto = () => {
-    const d = detectBands(ratio, +$('#ratio').value / 100, $('#sym').checked);
+  const autoWith = img => {
+    const thr = +$('#thr').value;
+    const d = detectBands(columnBrightRatio(img, thr), +$('#ratio').value / 100, $('#sym').checked);
     sl.value = d.left; sr.value = d.right;
-    const rr = rowBrightRatio(img, +$('#thr').value, d.left, w - d.right);
-    let v = detectBands(rr, +$('#vratio').value / 100, false);
+    let v = detectBands(rowBrightRatio(img, thr, d.left, w - d.right), +$('#vratio').value / 100, false);
     v = { left: v.left, right: v.right };   // detectBands の left/right を 上/下 として使う
     if (kindSel.value === 'item') {
-      const card = detectCardRows(img, +$('#thr').value, d.left, d.right);
+      const card = detectCardRows(img, thr, d.left, d.right);
       if (card.len > h * 0.5) v = { left: card.top, right: card.bottom };   // アイテム画面はカードの上下端に合わせる
     }
     st.value = v.left; sb.value = v.right;
     redraw();
   };
+  const auto = () => enqueue(() => withImage(file, autoWith));
   sl.oninput = sr.oninput = st.oninput = sb.oninput = redraw;
   document.addEventListener('recalc', auto);
+
+  // 現在の切り取り範囲で元画像から等倍の切り出しを作る(使い終わったら呼び出し側で解放する)
+  const getFull = () => enqueue(() => withImage(file, img => {
+    const L = +sl.value, R = +sr.value, T = +st.value, B = +sb.value;
+    const c = document.createElement('canvas'); c.width = w - L - R; c.height = h - T - B;
+    c.getContext('2d').drawImage(img, L, T, c.width, c.height, 0, 0, c.width, c.height);
+    return c;
+  }));
 
   const card = document.createElement('div'); card.className = 'card';
   const ctl = document.createElement('div'); ctl.style.width = '100%';
   ctl.append(info2, '左をカット', sl, '右をカット', sr, '上をカット', st, '下をカット', sb);
-  card.append(Object.assign(img, { alt: '元' }), crop);
+  card.append(small, crop);
   const t = document.createElement('table');
   t.innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v === null ? '<span class="kind"></span>' : v}</td></tr>`).join('');
   const kindSel = document.createElement('select');
   kindSel.innerHTML = '<option value="result">リザルト</option><option value="item">アイテム</option>';
   kindSel.value = score >= RESULT_THRESHOLD ? 'result' : 'item';
-  kindSel.onchange = () => { auto(); render(); };
+  kindSel.onchange = () => { auto().then(render); };
   t.querySelector('.kind').append(kindSel, ` 得点 ${score.toFixed(3)}(しきい値 ${RESULT_THRESHOLD})`);
   // コラージュに含めるかどうか(重複アラートのパネルとも連動)
   const inc = document.createElement('label');
   const incBox = document.createElement('input'); incBox.type = 'checkbox'; incBox.checked = true;
   inc.append(incBox, ' コラージュに含める');
   card.append(inc, t, ctl);
-  auto();
+  await auto();
 
   // 撮影日時(Exif優先、無ければ lastModified)。Exifは "YYYY:MM:DD HH:MM:SS" 形式
   let time = file.lastModified;
   const m = exifDate && exifDate.match(/(\d+):(\d+):(\d+) (\d+):(\d+):(\d+)/);
   if (m) time = new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
-  return { card, crop, incBox, kindSel, score, time, name: file.name, src: exifDate ? 'Exif' : 'lastModified' };
+  return { card, crop, getFull, incBox, kindSel, score, time, name: file.name, src: exifDate ? 'Exif' : 'lastModified' };
 }
 
 // --- 連続撮影(重複の疑い)の検出 ---
@@ -306,12 +331,16 @@ $('#gen').onclick = async () => {
       const stamp = stampOf(st.result.time), box = document.createElement('div'); box.className = 'card'; box.style.display = 'block';
       box.append(Object.assign(document.createElement('b'), { textContent: `配信 ${stamp}` }));
       p.append(box);
-      await addOutput(box, st.result.crop, `${stamp}_result.png`, stamp, false);
+      await addOutput(box, await st.result.getFull(), `${stamp}_result.png`, stamp, true);
       const chosen = st.items.filter(i => i.incBox.checked).sort((a, b) => a.time - b.time);
       const groups = splitEven(chosen);
       for (let k = 0; k < groups.length; k++) {
         $('#saveMsg').textContent = `生成中… ${stamp} (${k + 1}/${groups.length})`;
-        await addOutput(box, drawCollage(groups[k].map(i => i.crop)), `${stamp}_items_${k + 1}.png`, stamp, true);
+        const crops = [];
+        for (const it of groups[k]) crops.push(await it.getFull());
+        const collage = drawCollage(crops);
+        crops.forEach(c => { c.width = c.height = 0; });   // 元の切り出しは即解放
+        await addOutput(box, collage, `${stamp}_items_${k + 1}.png`, stamp, true);
         await new Promise(r => setTimeout(r, 0));   // 描画とメモリ回収の機会を与える
       }
       if (!chosen.length) box.append('(コラージュ対象のアイテムなし)');
@@ -333,10 +362,14 @@ $('#save').onclick = async () => {
   } catch (e) { msg.textContent = '保存に失敗: ' + e.message; }
   $('#save').disabled = !outputs.length;
 };
-document.addEventListener('recalc', () => setTimeout(render, 0));  // 切り取り後のサムネイルを更新
+document.addEventListener('recalc', () => enqueue(async () => {}).then(render));  // 切り取り後のサムネイルを更新
 $('#file').addEventListener('change', async e => {
   $('#out').innerHTML = ''; items = [];
-  for (const f of e.target.files) { try { items.push(await handle(f)); } catch (err) { $('#out').append(`${f.name}: ${err}`); } }
+  const all = [...e.target.files];
+  for (const [i, f] of all.entries()) {
+    $('#count').textContent = `読み込み中 ${i + 1}/${all.length}: ${f.name}`;
+    try { items.push(await handle(f)); } catch (err) { $('#out').append(`${f.name}: ${err}`); }
+  }
   render();
 });
 
