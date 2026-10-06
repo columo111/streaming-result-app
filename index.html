@@ -43,11 +43,14 @@
 <div id="streamPanel"></div>
 <button id="gen">コラージュを生成</button>
 <div id="genPanel"></div>
+<button id="save" disabled>Googleドライブに保存</button> <span id="saveMsg"></span>
 <div id="out"></div>
 
 <script src="detect.js"></script>
 <script src="template.js"></script>
 <script src="collage.js"></script>
+<script src="drive.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
 const RESULT_THRESHOLD = 0.75;  // この得点以上ならリザルト画面と判定
 const $ = s => document.querySelector(s);
@@ -279,7 +282,9 @@ function splitEven(list, max = 6) {
 }
 const pad2 = n => String(n).padStart(2, '0');
 const stampOf = ms => { const d = new Date(ms); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}`; };
-function addOutput(parent, canvas, name) {
+let outputs = [];   // 生成済みの出力 { stamp, name, canvas }
+function addOutput(parent, canvas, name, stamp) {
+  outputs.push({ stamp, name, canvas });
   const wrap = document.createElement('div'); wrap.style.margin = '8px 0';
   const view = document.createElement('canvas'); view.width = canvas.width; view.height = canvas.height;
   view.getContext('2d').drawImage(canvas, 0, 0);
@@ -289,19 +294,33 @@ function addOutput(parent, canvas, name) {
   wrap.append(view, document.createElement('br'), a); parent.append(wrap);
 }
 $('#gen').onclick = () => {
-  const { streams } = groupStreams(), p = $('#genPanel'); p.innerHTML = '';
+  const { streams } = groupStreams(), p = $('#genPanel'); p.innerHTML = ''; outputs = []; $('#save').disabled = true; $('#saveMsg').textContent = '';
   if (!streams.length) { p.textContent = 'リザルト画面がないため生成できません。'; return; }
   streams.forEach(st => {
     const stamp = stampOf(st.result.time), box = document.createElement('div'); box.className = 'card'; box.style.display = 'block';
     box.append(Object.assign(document.createElement('b'), { textContent: `配信 ${stamp}` }));
-    addOutput(box, st.result.crop, `${stamp}_result.png`);
+    addOutput(box, st.result.crop, `${stamp}_result.png`, stamp);
     const chosen = st.items.filter(i => i.incBox.checked).sort((a, b) => a.time - b.time);
     splitEven(chosen).forEach((g, k, all) => {
-      if (g.length) addOutput(box, drawCollage(g.map(i => i.crop)), `${stamp}_items_${k + 1}.png`);
+      if (g.length) addOutput(box, drawCollage(g.map(i => i.crop)), `${stamp}_items_${k + 1}.png`, stamp);
     });
     if (!chosen.length) box.append('(コラージュ対象のアイテムなし)');
     p.append(box);
   });
+  $('#save').disabled = !outputs.length;
+};
+
+// --- Googleドライブへ保存 ---
+$('#save').onclick = async () => {
+  const msg = $('#saveMsg');
+  if (!DRIVE_CLIENT_ID) { msg.textContent = 'drive.js の DRIVE_CLIENT_ID が未設定です。'; return; }
+  $('#save').disabled = true;
+  try {
+    const files = await Promise.all(outputs.map(async o => ({ stamp: o.stamp, name: o.name, blob: await new Promise(r => o.canvas.toBlob(r, 'image/png')) })));
+    await driveSaveAll(files, (d, n, name) => { msg.textContent = `保存中 ${d}/${n}: ${name}`; });
+    msg.textContent = `✔ ${files.length} 枚を StreamResults に保存しました。`;
+  } catch (e) { msg.textContent = '保存に失敗: ' + e.message; }
+  $('#save').disabled = !outputs.length;
 };
 document.addEventListener('recalc', () => setTimeout(render, 0));  // 切り取り後のサムネイルを更新
 $('#file').addEventListener('change', async e => {
