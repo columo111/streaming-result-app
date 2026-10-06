@@ -111,7 +111,7 @@ function inspect(buf) {
 
 // 元画像は解析・切り出しのときだけ読み込んで手放す(78枚でもiPadのメモリに収まるように)。
 // 画面に持つのは縮小画像だけで、最終出力は生成時に元ファイルから1枚ずつ切り出す。
-const PREVIEW_W = 320;
+const PREVIEW_W = 240;
 let jobs = Promise.resolve();   // 画像の読み込みを1枚ずつ直列に行う
 const enqueue = fn => (jobs = jobs.then(fn, fn));
 async function withImage(file, fn) {
@@ -312,12 +312,14 @@ const toBlob = c => new Promise(r => c.toBlob(r, 'image/png'));
 // canvas を PNG にして表示・保存用に保持する。release=true なら canvas を即解放(メモリ節約)
 async function addOutput(parent, canvas, name, stamp, release) {
   const blob = await toBlob(canvas), w = canvas.width, h = canvas.height;
+  // 画面に出すのは縮小プレビューだけ(等倍をimgで並べるとSafariがメモリを使い切って落ちる)
+  const view = document.createElement('canvas'); view.width = 280; view.height = Math.round(h * 280 / w);
+  view.getContext('2d').drawImage(canvas, 0, 0, view.width, view.height);
+  view.style.cssText = 'background:#fff;border:1px solid #666';
   if (release) canvas.width = canvas.height = 0;
   outputs.push({ stamp, name, blob });
   const wrap = document.createElement('div'); wrap.style.margin = '8px 0';
-  const view = document.createElement('img'); view.src = URL.createObjectURL(blob);
-  view.style.cssText = 'max-width:100%;max-height:360px;background:#fff;border:1px solid #666';
-  const a = document.createElement('a'); a.textContent = ` ${name} (${w}×${h})を保存`; a.download = name; a.style.color = '#9cf'; a.href = view.src;
+  const a = document.createElement('a'); a.textContent = ` ${name} (${w}×${h})を保存`; a.download = name; a.style.color = '#9cf'; a.href = URL.createObjectURL(blob);
   wrap.append(view, document.createElement('br'), a); parent.append(wrap);
 }
 let generating = false;
