@@ -282,32 +282,43 @@ function splitEven(list, max = 6) {
 }
 const pad2 = n => String(n).padStart(2, '0');
 const stampOf = ms => { const d = new Date(ms); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}`; };
-let outputs = [];   // 生成済みの出力 { stamp, name, canvas }
-function addOutput(parent, canvas, name, stamp) {
-  outputs.push({ stamp, name, canvas });
+let outputs = [];   // 生成済みの出力 { stamp, name, blob }
+const toBlob = c => new Promise(r => c.toBlob(r, 'image/png'));
+// canvas を PNG にして表示・保存用に保持する。release=true なら canvas を即解放(メモリ節約)
+async function addOutput(parent, canvas, name, stamp, release) {
+  const blob = await toBlob(canvas), w = canvas.width, h = canvas.height;
+  if (release) canvas.width = canvas.height = 0;
+  outputs.push({ stamp, name, blob });
   const wrap = document.createElement('div'); wrap.style.margin = '8px 0';
-  const view = document.createElement('canvas'); view.width = canvas.width; view.height = canvas.height;
-  view.getContext('2d').drawImage(canvas, 0, 0);
+  const view = document.createElement('img'); view.src = URL.createObjectURL(blob);
   view.style.cssText = 'max-width:100%;max-height:360px;background:#fff;border:1px solid #666';
-  const a = document.createElement('a'); a.textContent = ` ${name} (${canvas.width}×${canvas.height})を保存`; a.download = name; a.style.color = '#9cf';
-  canvas.toBlob(b => { a.href = URL.createObjectURL(b); }, 'image/png');
+  const a = document.createElement('a'); a.textContent = ` ${name} (${w}×${h})を保存`; a.download = name; a.style.color = '#9cf'; a.href = view.src;
   wrap.append(view, document.createElement('br'), a); parent.append(wrap);
 }
-$('#gen').onclick = () => {
+let generating = false;
+$('#gen').onclick = async () => {
+  if (generating) return;
+  generating = true; $('#gen').disabled = true;
   const { streams } = groupStreams(), p = $('#genPanel'); p.innerHTML = ''; outputs = []; $('#save').disabled = true; $('#saveMsg').textContent = '';
-  if (!streams.length) { p.textContent = 'リザルト画面がないため生成できません。'; return; }
-  streams.forEach(st => {
-    const stamp = stampOf(st.result.time), box = document.createElement('div'); box.className = 'card'; box.style.display = 'block';
-    box.append(Object.assign(document.createElement('b'), { textContent: `配信 ${stamp}` }));
-    addOutput(box, st.result.crop, `${stamp}_result.png`, stamp);
-    const chosen = st.items.filter(i => i.incBox.checked).sort((a, b) => a.time - b.time);
-    splitEven(chosen).forEach((g, k, all) => {
-      if (g.length) addOutput(box, drawCollage(g.map(i => i.crop)), `${stamp}_items_${k + 1}.png`, stamp);
-    });
-    if (!chosen.length) box.append('(コラージュ対象のアイテムなし)');
-    p.append(box);
-  });
-  $('#save').disabled = !outputs.length;
+  try {
+    if (!streams.length) { p.textContent = 'リザルト画面がないため生成できません。'; return; }
+    for (const st of streams) {
+      const stamp = stampOf(st.result.time), box = document.createElement('div'); box.className = 'card'; box.style.display = 'block';
+      box.append(Object.assign(document.createElement('b'), { textContent: `配信 ${stamp}` }));
+      p.append(box);
+      await addOutput(box, st.result.crop, `${stamp}_result.png`, stamp, false);
+      const chosen = st.items.filter(i => i.incBox.checked).sort((a, b) => a.time - b.time);
+      const groups = splitEven(chosen);
+      for (let k = 0; k < groups.length; k++) {
+        $('#saveMsg').textContent = `生成中… ${stamp} (${k + 1}/${groups.length})`;
+        await addOutput(box, drawCollage(groups[k].map(i => i.crop)), `${stamp}_items_${k + 1}.png`, stamp, true);
+        await new Promise(r => setTimeout(r, 0));   // 描画とメモリ回収の機会を与える
+      }
+      if (!chosen.length) box.append('(コラージュ対象のアイテムなし)');
+    }
+    $('#saveMsg').textContent = '';
+  } catch (e) { $('#saveMsg').textContent = '生成に失敗: ' + e.message; }
+  finally { generating = false; $('#gen').disabled = false; $('#save').disabled = !outputs.length; }
 };
 
 // --- Googleドライブへ保存 ---
@@ -316,7 +327,7 @@ $('#save').onclick = async () => {
   if (!DRIVE_CLIENT_ID) { msg.textContent = 'drive.js の DRIVE_CLIENT_ID が未設定です。'; return; }
   $('#save').disabled = true;
   try {
-    const files = await Promise.all(outputs.map(async o => ({ stamp: o.stamp, name: o.name, blob: await new Promise(r => o.canvas.toBlob(r, 'image/png')) })));
+    const files = outputs;
     await driveSaveAll(files, (d, n, name) => { msg.textContent = `保存中 ${d}/${n}: ${name}`; });
     msg.textContent = `✔ ${files.length} 枚を StreamResults に保存しました。`;
   } catch (e) { msg.textContent = '保存に失敗: ' + e.message; }

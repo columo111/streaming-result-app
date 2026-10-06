@@ -7,6 +7,7 @@ function columnBrightRatio(img, thr) {
   const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(img, 0, 0);
   const data = ctx.getImageData(0, 0, w, h).data;
+  c.width = c.height = 0;   // 作業用キャンバスのメモリを解放(iPadのSafariは大きなキャンバスが溜まると落ちる)
   const step = Math.max(1, Math.floor(h / 300));
   const ratio = new Float32Array(w);
   for (let x = 0; x < w; x++) {
@@ -28,6 +29,7 @@ function rowBrightRatio(img, thr, x0, x1) {
   const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(img, 0, 0);
   const data = ctx.getImageData(0, 0, w, h).data;
+  c.width = c.height = 0;   // 作業用キャンバスのメモリを解放(iPadのSafariは大きなキャンバスが溜まると落ちる)
   const step = Math.max(1, Math.floor((x1 - x0) / 300));
   const ratio = new Float32Array(h);
   for (let y = 0; y < h; y++) {
@@ -84,6 +86,7 @@ function detectCardRows(img, thr, left, right) {
   const ctx = c.getContext('2d', { willReadFrequently: true });
   ctx.drawImage(img, 0, 0);
   const d = ctx.getImageData(0, 0, w, h).data;
+  c.width = c.height = 0;
   const inset = 4, xs = [left + inset, w - right - 1 - inset];
   const lit = y => xs.every(x => { const i = (y * w + x) * 4; return Math.max(d[i], d[i+1], d[i+2]) > thr; });
   let best = { start: 0, len: 0 }, start = -1;
