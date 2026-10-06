@@ -26,25 +26,45 @@
   .grp { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 10px; padding-top: 10px; border-top: 1px solid #653; }
   .cell { display: inline-block; margin: 0; }
   .cell canvas { height: 160px; border: 1px solid #666; }
+  .steps { margin: 4px 0 16px; padding-left: 1.4em; color: #aaa; font-size: 15px; line-height: 1.6; }
+  button.primary { display: block; width: 100%; max-width: 480px; margin: 16px 0 8px; padding: 14px; border: 0; border-radius: 10px; background: #3b82f6; color: #fff; font-weight: 600; }
+  button.primary:disabled { background: #333; color: #777; }
+  input[type=file]::file-selector-button { padding: 12px 18px; margin-right: 12px; border: 0; border-radius: 10px; background: #3b82f6; color: #fff; font-size: 18px; font-weight: 600; }
+  details.more { border: 1px solid #333; border-radius: 8px; padding: 8px 12px; margin: 20px 0; }
+  details.more summary { cursor: pointer; color: #9cf; padding: 6px 0; }
+  #recalc { margin-top: 8px; padding: 8px 16px; }
 </style>
 </head>
 <body>
-<h2>検証: 撮影日時の取得 / 黒帯の自動検出</h2>
+<h2>配信リザルト加工</h2>
+<ol class="steps">
+  <li>画像(配信中のアイテムとリザルトのスクショ)を選ぶ</li>
+  <li>連続撮影の警告と配信ごとの枚数を確認する</li>
+  <li>「コラージュを生成」→「Googleドライブに保存」</li>
+</ol>
 <input id="file" type="file" accept="image/*" multiple>
-<label>黒とみなす明るさ(0-255): <input id="thr" type="number" value="24" min="0" max="255" style="width:5em"></label>
-<label>余白とみなす列の明るい画素の許容割合(%): <input id="ratio" type="number" value="10" min="0" max="50" step="0.5" style="width:5em"></label>
-<label>上下の許容割合(%): <input id="vratio" type="number" value="15" min="0" max="90" step="0.5" style="width:5em"></label>
-<label><input id="sym" type="checkbox" checked> 左右対称に切る(小さい方に揃える)</label>
-<label>連続撮影とみなす間隔(秒以内): <input id="dup" type="number" value="2" min="0" max="60" step="1" style="width:5em"></label>
-<label>同一配信とみなす範囲(リザルトの何時間前まで): <input id="win" type="number" value="2" min="0.5" max="24" step="0.5" style="width:5em"></label>
-<button id="recalc">再判定</button>
 <div id="count" style="margin:8px 0"></div>
 <div id="dupPanel"></div>
 <div id="streamPanel"></div>
-<button id="gen">コラージュを生成</button>
+<button id="gen" class="primary" disabled>コラージュを生成</button>
 <div id="genPanel"></div>
-<button id="save" disabled>Googleドライブに保存</button> <span id="saveMsg"></span>
-<div id="out"></div>
+<button id="save" class="primary" disabled>Googleドライブに保存</button> <span id="saveMsg"></span>
+
+<details class="more">
+  <summary>画像ごとの詳細(切り取り・種別の手動調整)</summary>
+  <div id="out"></div>
+</details>
+
+<details class="more">
+  <summary>詳細設定(判定のしきい値など)</summary>
+  <label>黒とみなす明るさ(0-255): <input id="thr" type="number" value="24" min="0" max="255" style="width:5em"></label>
+  <label>余白とみなす列の明るい画素の許容割合(%): <input id="ratio" type="number" value="10" min="0" max="50" step="0.5" style="width:5em"></label>
+  <label>上下の許容割合(%): <input id="vratio" type="number" value="15" min="0" max="90" step="0.5" style="width:5em"></label>
+  <label><input id="sym" type="checkbox" checked> 左右対称に切る(小さい方に揃える)</label>
+  <label>連続撮影とみなす間隔(秒以内): <input id="dup" type="number" value="2" min="0" max="60" step="1" style="width:5em"></label>
+  <label>同一配信とみなす範囲(リザルトの何時間前まで): <input id="win" type="number" value="2" min="0.5" max="24" step="0.5" style="width:5em"></label>
+  <button id="recalc">再判定</button>
+</details>
 
 <script src="detect.js"></script>
 <script src="template.js"></script>
@@ -260,6 +280,7 @@ function render() {
   items.forEach(it => it.incBox.onchange = () => { count(); });
   count();
   renderStreams();
+  if (!generating) $('#gen').disabled = !items.length;
 }
 
 // --- 配信ごとのグルーピング ---
@@ -366,7 +387,7 @@ $('#save').onclick = async () => {
 };
 document.addEventListener('recalc', () => enqueue(async () => {}).then(render));  // 切り取り後のサムネイルを更新
 $('#file').addEventListener('change', async e => {
-  $('#out').innerHTML = ''; items = [];
+  $('#out').innerHTML = ''; items = []; outputs = []; $('#genPanel').innerHTML = ''; $('#save').disabled = true; $('#saveMsg').textContent = ''; $('#gen').disabled = true;
   const all = [...e.target.files];
   for (const [i, f] of all.entries()) {
     $('#count').textContent = `読み込み中 ${i + 1}/${all.length}: ${f.name}`;
