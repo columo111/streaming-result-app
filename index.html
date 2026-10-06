@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>配信リザルト加工</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="theme-color" content="#111111">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="リザルト">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 16px; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); background: #111; color: #eee; }
+  button, input { font-size: 18px; }
+  .card { border: 1px solid #444; border-radius: 8px; padding: 12px; margin: 12px 0; display: flex; gap: 12px; flex-wrap: wrap; }
+  .card img, .card canvas { max-height: 260px; max-width: 100%; border: 1px solid #666; background: #333; }
+  table { border-collapse: collapse; font-size: 14px; }
+  td { padding: 2px 8px; border-bottom: 1px solid #333; vertical-align: top; word-break: break-all; }
+  td:first-child { color: #9cf; white-space: nowrap; }
+  .ok { color: #7f7; } .ng { color: #f88; }
+  label { display: block; margin: 8px 0; }
+  .alert { border: 2px solid #f90; background: #321d00; border-radius: 8px; padding: 12px; margin: 12px 0; }
+  .okbox { border: 1px solid #3a3; border-radius: 8px; padding: 8px 12px; margin: 12px 0; color: #7f7; }
+  .grp { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 10px; padding-top: 10px; border-top: 1px solid #653; }
+  .cell { display: inline-block; margin: 0; }
+  .cell canvas { height: 160px; border: 1px solid #666; }
+</style>
+</head>
+<body>
+<h2>検証: 撮影日時の取得 / 黒帯の自動検出</h2>
+<input id="file" type="file" accept="image/*" multiple>
+<label>黒とみなす明るさ(0-255): <input id="thr" type="number" value="24" min="0" max="255" style="width:5em"></label>
+<label>余白とみなす列の明るい画素の許容割合(%): <input id="ratio" type="number" value="10" min="0" max="50" step="0.5" style="width:5em"></label>
+<label>上下の許容割合(%): <input id="vratio" type="number" value="15" min="0" max="90" step="0.5" style="width:5em"></label>
+<label><input id="sym" type="checkbox" checked> 左右対称に切る(小さい方に揃える)</label>
+<label>連続撮影とみなす間隔(秒以内): <input id="dup" type="number" value="2" min="0" max="60" step="1" style="width:5em"></label>
+<label>同一配信とみなす範囲(リザルトの何時間前まで): <input id="win" type="number" value="2" min="0.5" max="24" step="0.5" style="width:5em"></label>
+<button id="recalc">再判定</button>
+<div id="count" style="margin:8px 0"></div>
+<div id="dupPanel"></div>
+<div id="streamPanel"></div>
+<button id="gen">コラージュを生成</button>
+<div id="genPanel"></div>
+<div id="out"></div>
+
+<script src="detect.js"></script>
+<script src="template.js"></script>
+<script src="collage.js"></script>
+<script>
+const RESULT_THRESHOLD = 0.75;  // この得点以上ならリザルト画面と判定
+const $ = s => document.querySelector(s);
+const fmt = d => d ? d.toLocaleString('ja-JP') : null;
+
+// --- TIFF/Exif パーサ ---
+function parseTiff(dv, base) {
+  const le = dv.getUint16(base) === 0x4949;
+  const u16 = o => dv.getUint16(base + o, le), u32 = o => dv.getUint32(base + o, le);
+  const str = (o, n) => { let s = ''; for (let i = 0; i < n - 1; i++) s += String.fromCharCode(dv.getUint8(base + o + i)); return s; };
+  const res = {};
+  const readIfd = (off, names) => {
+    const n = u16(off);
+    for (let i = 0; i < n; i++) {
+      const e = off + 2 + i * 12, tag = u16(e), type = u16(e + 2), cnt = u32(e + 4);
+      if (type === 2) { const vo = cnt > 4 ? u32(e + 8) : e + 8; if (names[tag]) res[names[tag]] = str(vo, cnt); }
+      if (tag === 0x8769) readIfd(u32(e + 8), { 0x9003: 'DateTimeOriginal', 0x9004: 'DateTimeDigitized' });
+    }
+  };
+  readIfd(u32(4), { 0x0132: 'DateTime', 0x010f: 'Make', 0x0110: 'Model' });
+  return res;
+}
+
+// --- コンテナ別メタデータ抽出 ---
+function inspect(buf) {
+  const dv = new DataView(buf), info = { container: '不明', chunks: [], exif: null, text: {} };
+  try {
+    if (dv.getUint32(0) === 0x89504e47) {
+      info.container = 'PNG';
+      let p = 8;
+      while (p + 8 <= dv.byteLength) {
+        const len = dv.getUint32(p);
+        const type = String.fromCharCode(dv.getUint8(p+4), dv.getUint8(p+5), dv.getUint8(p+6), dv.getUint8(p+7));
+        if (!info.chunks.includes(type)) info.chunks.push(type);
+        if (type === 'eXIf') info.exif = parseTiff(dv, p + 8);
+        if (type === 'tEXt') {
+          let s = ''; for (let i = 0; i < len; i++) s += String.fromCharCode(dv.getUint8(p + 8 + i));
+          const [k, ...v] = s.split('\0'); info.text[k] = v.join('');
+        }
+        if (type === 'IEND') break;
+        p += 12 + len;
+      }
+    } else if (dv.getUint16(0) === 0xffd8) {
+      info.container = 'JPEG';
+      let p = 2;
+      while (p + 4 <= dv.byteLength) {
+        const m = dv.getUint16(p), len = dv.getUint16(p + 2);
+        if (m === 0xffe1 && dv.getUint32(p + 4) === 0x45786966) { info.exif = parseTiff(dv, p + 10); break; }
+        if (m === 0xffda) break;
+        p += 2 + len;
+      }
+    } else if (String.fromCharCode(...new Uint8Array(buf, 4, 8)).startsWith('ftyp')) {
+      info.container = 'HEIC/MP4系(Exif未解析)';
+    }
+  } catch (e) { info.error = String(e); }
+  return info;
+}
+
+async function handle(file) {
+  const buf = await file.arrayBuffer();
+  const info = inspect(buf);
+  const url = URL.createObjectURL(new Blob([buf], { type: file.type }));
+  const img = new Image(); await new Promise((ok, ng) => { img.onload = ok; img.onerror = ng; img.src = url; });
+  const w = img.naturalWidth, h = img.naturalHeight;
+  const ratio = columnBrightRatio(img, +$('#thr').value);
+  const b = { w, h };
+  const bands = detectBands(ratio, +$('#ratio').value / 100, true);
+  const score = matchScore(featureOf(img, bands.left, bands.right), RESULT_TEMPLATE);
+
+  const exifDate = info.exif && (info.exif.DateTimeOriginal || info.exif.DateTimeDigitized || info.exif.DateTime);
+  const tEXt = Object.entries(info.text).map(([k, v]) => `${k}=${v}`).join(' / ');
+  const rows = [
+    ['ファイル名', file.name],
+    ['形式', `${file.type || '(type無し)'} / 実体: ${info.container}`],
+    ['サイズ', `${b.w}×${b.h}px / ${(file.size/1024).toFixed(0)}KB`],
+    ['lastModified', `<span class="${file.lastModified ? 'ok' : 'ng'}">${fmt(new Date(file.lastModified))}</span>`],
+    ['Exif日時', exifDate ? `<span class="ok">${exifDate}</span>` : '<span class="ng">なし</span>'],
+    ['種別判定', null],
+    ['PNGチャンク', info.chunks.join(', ') || '-'],
+    ['PNGテキスト', tEXt || '-'],
+  ];
+
+  const crop = document.createElement('canvas');
+  const info2 = document.createElement('div');
+  const sl = document.createElement('input'); sl.type = 'range'; sl.min = 0; sl.max = Math.floor(w / 2); sl.style.width = '100%';
+  const sr = document.createElement('input'); sr.type = 'range'; sr.min = 0; sr.max = Math.floor(w / 2); sr.style.width = '100%';
+  const st = document.createElement('input'); st.type = 'range'; st.min = 0; st.max = Math.floor(h / 2); st.style.width = '100%';
+  const sb = document.createElement('input'); sb.type = 'range'; sb.min = 0; sb.max = Math.floor(h / 2); sb.style.width = '100%';
+  const redraw = () => {
+    const L = +sl.value, R = +sr.value, T = +st.value, B = +sb.value;
+    const cw = w - L - R, ch = h - T - B;
+    crop.width = cw; crop.height = ch;
+    crop.getContext('2d').drawImage(img, L, T, cw, ch, 0, 0, cw, ch);
+    info2.textContent = `左 ${L} / 右 ${R} / 上 ${T} / 下 ${B}px → ${cw}×${ch}px`;
+  };
+  const auto = () => {
+    const d = detectBands(ratio, +$('#ratio').value / 100, $('#sym').checked);
+    sl.value = d.left; sr.value = d.right;
+    const rr = rowBrightRatio(img, +$('#thr').value, d.left, w - d.right);
+    let v = detectBands(rr, +$('#vratio').value / 100, false);
+    v = { left: v.left, right: v.right };   // detectBands の left/right を 上/下 として使う
+    if (kindSel.value === 'item') {
+      const card = detectCardRows(img, +$('#thr').value, d.left, d.right);
+      if (card.len > h * 0.5) v = { left: card.top, right: card.bottom };   // アイテム画面はカードの上下端に合わせる
+    }
+    st.value = v.left; sb.value = v.right;
+    redraw();
+  };
+  sl.oninput = sr.oninput = st.oninput = sb.oninput = redraw;
+  document.addEventListener('recalc', auto);
+
+  const card = document.createElement('div'); card.className = 'card';
+  const ctl = document.createElement('div'); ctl.style.width = '100%';
+  ctl.append(info2, '左をカット', sl, '右をカット', sr, '上をカット', st, '下をカット', sb);
+  card.append(Object.assign(img, { alt: '元' }), crop);
+  const t = document.createElement('table');
+  t.innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v === null ? '<span class="kind"></span>' : v}</td></tr>`).join('');
+  const kindSel = document.createElement('select');
+  kindSel.innerHTML = '<option value="result">リザルト</option><option value="item">アイテム</option>';
+  kindSel.value = score >= RESULT_THRESHOLD ? 'result' : 'item';
+  kindSel.onchange = () => { auto(); render(); };
+  t.querySelector('.kind').append(kindSel, ` 得点 ${score.toFixed(3)}(しきい値 ${RESULT_THRESHOLD})`);
+  // コラージュに含めるかどうか(重複アラートのパネルとも連動)
+  const inc = document.createElement('label');
+  const incBox = document.createElement('input'); incBox.type = 'checkbox'; incBox.checked = true;
+  inc.append(incBox, ' コラージュに含める');
+  card.append(inc, t, ctl);
+  auto();
+
+  // 撮影日時(Exif優先、無ければ lastModified)。Exifは "YYYY:MM:DD HH:MM:SS" 形式
+  let time = file.lastModified;
+  const m = exifDate && exifDate.match(/(\d+):(\d+):(\d+) (\d+):(\d+):(\d+)/);
+  if (m) time = new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
+  return { card, crop, incBox, kindSel, score, time, name: file.name, src: exifDate ? 'Exif' : 'lastModified' };
+}
+
+// --- 連続撮影(重複の疑い)の検出 ---
+let items = [];
+const timeStr = ms => new Date(ms).toLocaleTimeString('ja-JP');
+
+function render() {
+  const sec = +$('#dup').value;
+  items.sort((a, b) => a.time - b.time);
+  $('#out').innerHTML = '';
+  items.forEach(it => $('#out').append(it.card));
+
+  // 前の画像との間隔が sec 秒以内なら同じグループに連結
+  const groups = [];
+  items.forEach((it, i) => {
+    const prev = items[i - 1];
+    if (prev && (it.time - prev.time) / 1000 <= sec) groups[groups.length - 1].push(it);
+    else groups.push([it]);
+  });
+  const dups = groups.filter(g => g.length > 1);
+
+  const panel = $('#dupPanel'); panel.innerHTML = '';
+  if (dups.length) {
+    panel.className = 'alert';
+    panel.append(Object.assign(document.createElement('b'), {
+      textContent: `⚠ ${sec}秒以内に撮影された画像が ${dups.length} グループあります。コラージュに含める画像を選んでください。`
+    }));
+    dups.forEach(g => {
+      const row = document.createElement('div'); row.className = 'grp';
+      g.forEach((it, i) => {
+        const cell = document.createElement('label'); cell.className = 'cell';
+        const th = document.createElement('canvas');
+        th.width = it.crop.width; th.height = it.crop.height;
+        th.getContext('2d').drawImage(it.crop, 0, 0);
+        const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = it.incBox.checked;
+        cb.onchange = () => { it.incBox.checked = cb.checked; count(); };
+        it.incBox.addEventListener('change', () => { cb.checked = it.incBox.checked; });
+        const gap = i ? ` (+${((it.time - g[i - 1].time) / 1000).toFixed(0)}秒)` : '';
+        cell.append(th, document.createElement('br'), cb, ` ${timeStr(it.time)}${gap}`);
+        row.append(cell);
+      });
+      panel.append(row);
+    });
+  } else {
+    panel.className = items.length ? 'okbox' : '';
+    if (items.length) panel.textContent = `${sec}秒以内の連続撮影はありません。`;
+  }
+  items.forEach(it => it.incBox.onchange = () => { count(); });
+  count();
+  renderStreams();
+}
+
+// --- 配信ごとのグルーピング ---
+// リザルトの撮影時刻を配信終了とし、その win 時間前までのアイテムを、直後のリザルトの配信にまとめる
+function groupStreams() {
+  const winMs = +$('#win').value * 3600e3;
+  const results = items.filter(i => i.kindSel.value === 'result').sort((a, b) => a.time - b.time);
+  const streams = results.map(r => ({ result: r, items: [] }));
+  const orphans = [];
+  items.filter(i => i.kindSel.value !== 'result').forEach(it => {
+    const s = streams.find(s => s.result.time >= it.time && s.result.time - it.time <= winMs);
+    (s ? s.items : orphans).push(it);
+  });
+  return { streams, orphans };
+}
+function renderStreams() {
+  const { streams, orphans } = groupStreams();
+  const p = $('#streamPanel'); p.innerHTML = ''; p.className = items.length ? 'okbox' : '';
+  const dt = ms => new Date(ms).toLocaleString('ja-JP');
+  const line = t => p.append(Object.assign(document.createElement('div'), { textContent: t }));
+  streams.forEach(s => line(`配信終了 ${dt(s.result.time)} : アイテム ${s.items.length} 枚(コラージュ対象 ${s.items.filter(i => i.incBox.checked).length} 枚)`));
+  if (orphans.length) {
+    const o = document.createElement('div'); o.className = 'ng';
+    o.textContent = `⚠ どの配信にも属さないアイテム ${orphans.length} 枚: ` + orphans.map(i => `${i.name}(${dt(i.time)})`).join(', ');
+    p.append(o);
+  }
+  if (!streams.length && items.length) line('リザルト画面が見つかりません。');
+}
+const count = () => {
+  const nResult = items.filter(i => i.kindSel.value === 'result').length;
+  $('#count').textContent = `コラージュ対象: ${items.filter(i => i.incBox.checked).length} / ${items.length} 枚 (リザルト判定 ${nResult} 枚 / アイテム判定 ${items.length - nResult} 枚)`;
+};
+
+$('#recalc').onclick = () => document.dispatchEvent(new Event('recalc'));
+$('#dup').onchange = () => render();
+$('#win').onchange = () => renderStreams();
+
+// --- コラージュ生成 ---
+// n枚を6枚以下の均等な組に分ける(例: 7→4+3、13→5+4+4)
+function splitEven(list, max = 6) {
+  const k = Math.ceil(list.length / max), base = Math.floor(list.length / k), extra = list.length % k;
+  const out = []; let p = 0;
+  for (let i = 0; i < k; i++) { const n = base + (i < extra ? 1 : 0); out.push(list.slice(p, p + n)); p += n; }
+  return out;
+}
+const pad2 = n => String(n).padStart(2, '0');
+const stampOf = ms => { const d = new Date(ms); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}_${pad2(d.getHours())}${pad2(d.getMinutes())}`; };
+function addOutput(parent, canvas, name) {
+  const wrap = document.createElement('div'); wrap.style.margin = '8px 0';
+  const view = document.createElement('canvas'); view.width = canvas.width; view.height = canvas.height;
+  view.getContext('2d').drawImage(canvas, 0, 0);
+  view.style.cssText = 'max-width:100%;max-height:360px;background:#fff;border:1px solid #666';
+  const a = document.createElement('a'); a.textContent = ` ${name} (${canvas.width}×${canvas.height})を保存`; a.download = name; a.style.color = '#9cf';
+  canvas.toBlob(b => { a.href = URL.createObjectURL(b); }, 'image/png');
+  wrap.append(view, document.createElement('br'), a); parent.append(wrap);
+}
+$('#gen').onclick = () => {
+  const { streams } = groupStreams(), p = $('#genPanel'); p.innerHTML = '';
+  if (!streams.length) { p.textContent = 'リザルト画面がないため生成できません。'; return; }
+  streams.forEach(st => {
+    const stamp = stampOf(st.result.time), box = document.createElement('div'); box.className = 'card'; box.style.display = 'block';
+    box.append(Object.assign(document.createElement('b'), { textContent: `配信 ${stamp}` }));
+    addOutput(box, st.result.crop, `${stamp}_result.png`);
+    const chosen = st.items.filter(i => i.incBox.checked).sort((a, b) => a.time - b.time);
+    splitEven(chosen).forEach((g, k, all) => {
+      if (g.length) addOutput(box, drawCollage(g.map(i => i.crop)), `${stamp}_items_${k + 1}.png`);
+    });
+    if (!chosen.length) box.append('(コラージュ対象のアイテムなし)');
+    p.append(box);
+  });
+};
+document.addEventListener('recalc', () => setTimeout(render, 0));  // 切り取り後のサムネイルを更新
+$('#file').addEventListener('change', async e => {
+  $('#out').innerHTML = ''; items = [];
+  for (const f of e.target.files) { try { items.push(await handle(f)); } catch (err) { $('#out').append(`${f.name}: ${err}`); } }
+  render();
+});
+
+// PWA: サービスワーカー登録(HTTPSまたはlocalhostでのみ有効。http://IPアドレス では登録されないが通常動作はする)
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+</script>
+</body>
+</html>
